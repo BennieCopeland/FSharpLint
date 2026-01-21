@@ -378,13 +378,14 @@ module Lint =
         | Configuration config -> Ok config
         | FromFile filePath ->
             try
-                Configuration.loadConfig filePath
+                JsonConfiguration.loadConfig filePath
                 |> Ok
             with
             | ex -> Error (string ex)
         | Default ->
             try
-                Configuration.loadConfig $"./{Configuration.SettingsFileName}"
+                JsonConfiguration.loadConfig $"./{JsonConfiguration.SettingsFileName}"
+                |> JsonConfiguration.merge Configuration.defaultConfiguration
                 |> Ok
             with
             | :? System.IO.FileNotFoundException ->

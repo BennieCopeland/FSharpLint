@@ -1,591 +1,613 @@
-﻿/// Loads configuration file from JSON into an object.
 module FSharpLint.Framework.Configuration
 
 open System
-open System.IO
-open System.Reflection
-open System.Text.Json
-open System.Text.Json.Serialization
-open FSharpLint.Framework
 open FSharpLint.Framework.Rules
 open FSharpLint.Framework.HintParser
 open FSharpLint.Rules
 
-[<Literal>]
-let SettingsFileName = "fsharplint.json"
-
 exception ConfigurationException of string
 
-module internal FSharpJsonConverter =
-
-    let jsonOptions =
-        let options =
-            JsonSerializerOptions(
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-            )
-        options.Converters.Add(JsonStringEnumConverter())
-        options
-
-module IgnoreFiles =
-
-    open System.Text.RegularExpressions
-
-    type IsDirectory = | IsDirectory of bool
-
-    [<NoComparison>]
-    type Ignore =
-        | Ignore of Regex list * IsDirectory
-        | Negate of Regex list * IsDirectory
-
-    let parseIgnorePath (path:string) =
-        let globToRegex glob =
-            Regex(
-                $"""^{Regex.Escape(glob).Replace(@"\*", ".*").Replace(@"\?", ".")}$""",
-                RegexOptions.IgnoreCase ||| RegexOptions.Singleline)
-
-        let isDirectory = path.EndsWith("/")
-
-        let getRegexSegments (path:string) =
-            path.Split([| '/' |], StringSplitOptions.RemoveEmptyEntries)
-            |> Array.map globToRegex
-
-        if path.StartsWith("!") then
-            getRegexSegments (path.Substring(1))
-            |> Array.toList
-            |> fun segments -> Negate(segments, IsDirectory(isDirectory))
-        else
-            getRegexSegments (if path.StartsWith(@"\!") then path.Substring(1) else path)
-            |> Array.toList
-            |> fun segments -> Ignore(segments, IsDirectory(isDirectory))
-
-    let private pathMatchesGlob (globs:Regex list) (path:string list) isDirectory =
-        let rec getRemainingGlobSeqForMatches (pathSegment:string) (globSeqs:Regex list list) =
-            globSeqs |> List.choose (function
-                | globSegment::remaining when globSegment.IsMatch(pathSegment) -> Some remaining
-                | _ -> None)
-
-        let rec doesGlobSeqMatchPathSeq remainingPath currentlyMatchingGlobs =
-            match remainingPath with
-            | [_] when isDirectory -> false
-            | currentSegment::remaining ->
-                let currentlyMatchingGlobs = globs::currentlyMatchingGlobs
-
-                let currentlyMatchingGlobs = getRemainingGlobSeqForMatches currentSegment currentlyMatchingGlobs
-
-                let aGlobWasCompletelyMatched = currentlyMatchingGlobs |> List.exists List.isEmpty
-
-                let matched = aGlobWasCompletelyMatched && (isDirectory || (not isDirectory && List.isEmpty remaining))
-
-                if matched then true
-                else doesGlobSeqMatchPathSeq remaining currentlyMatchingGlobs
-            | [] -> false
-
-        doesGlobSeqMatchPathSeq path []
-
-    let shouldFileBeIgnored (ignorePaths:Ignore list) (filePath:string) =
-        let segments = filePath.Split Path.DirectorySeparatorChar |> Array.toList
-
-        ignorePaths |> List.fold (fun isCurrentlyIgnored ignoreGlob ->
-            match ignoreGlob with
-            | Ignore(glob, IsDirectory(isDirectory))
-                when not isCurrentlyIgnored && pathMatchesGlob glob segments isDirectory -> true
-            | Negate(glob, IsDirectory(isDirectory))
-                when isCurrentlyIgnored && pathMatchesGlob glob segments isDirectory -> false
-            | _ -> isCurrentlyIgnored) false
-
-// Non-standard record field naming for config serialization.
-// fsharplint:disable RecordFieldNames
-type RuleConfig<'Config> = {
-    Enabled:bool
-    Config:'Config option
-}
+type RuleConfig<'Config> =
+    | Enabled of 'Config
+    | Disabled
 
 type EnabledConfig = RuleConfig<unit>
 
-let constructRuleIfEnabled rule ruleConfig = if ruleConfig.Enabled then Some rule else None
-
-let constructRuleWithConfig rule ruleConfig =
-    if ruleConfig.Enabled then
-        ruleConfig.Config |> Option.map rule
-    else
-        None
-
-let constructTypePrefixingRuleWithConfig rule (ruleConfig: RuleConfig<TypePrefixing.Config>) =
-    if ruleConfig.Enabled then
-        let config = ruleConfig.Config |> Option.defaultValue { Mode = TypePrefixing.Mode.Hybrid }
-        Some(rule config)
-    else
-        None
-
-type TupleFormattingConfig =
-    { tupleCommaSpacing:EnabledConfig option
-      tupleIndentation:EnabledConfig option
-      tupleParentheses:EnabledConfig option }
-with
-    member this.Flatten() =
-        [|
-            this.tupleCommaSpacing |> Option.bind (constructRuleIfEnabled TupleCommaSpacing.rule)
-            this.tupleIndentation |> Option.bind (constructRuleIfEnabled TupleIndentation.rule)
-            this.tupleParentheses |> Option.bind (constructRuleIfEnabled TupleParentheses.rule)
-        |] |> Array.choose id
-
-type PatternMatchFormattingConfig =
-    { patternMatchClausesOnNewLine:EnabledConfig option
-      patternMatchOrClausesOnNewLine:EnabledConfig option
-      patternMatchClauseIndentation:RuleConfig<PatternMatchClauseIndentation.Config> option
-      patternMatchExpressionIndentation:EnabledConfig option }
-with
-    member this.Flatten() =
-        [|
-            this.patternMatchClausesOnNewLine |> Option.bind (constructRuleIfEnabled PatternMatchClausesOnNewLine.rule)
-            this.patternMatchOrClausesOnNewLine |> Option.bind (constructRuleIfEnabled PatternMatchOrClausesOnNewLine.rule)
-            this.patternMatchClauseIndentation |> Option.bind (constructRuleWithConfig PatternMatchClauseIndentation.rule)
-            this.patternMatchExpressionIndentation |> Option.bind (constructRuleIfEnabled PatternMatchExpressionIndentation.rule)
-        |] |> Array.choose id
-
-type FormattingConfig =
-    { typedItemSpacing:RuleConfig<TypedItemSpacing.Config> option
-      typePrefixing:RuleConfig<TypePrefixing.Config> option
-      unionDefinitionIndentation:EnabledConfig option
-      moduleDeclSpacing:EnabledConfig option
-      classMemberSpacing:EnabledConfig option
-      tupleFormatting:TupleFormattingConfig option
-      patternMatchFormatting:PatternMatchFormattingConfig option }
-with
-    member this.Flatten() =
-        [|
-            this.typedItemSpacing |> Option.bind (constructRuleWithConfig TypedItemSpacing.rule) |> Option.toArray
-            this.typePrefixing |> Option.bind (constructTypePrefixingRuleWithConfig TypePrefixing.rule) |> Option.toArray
-            this.unionDefinitionIndentation |> Option.bind (constructRuleIfEnabled UnionDefinitionIndentation.rule) |> Option.toArray
-            this.moduleDeclSpacing |> Option.bind (constructRuleIfEnabled ModuleDeclSpacing.rule) |> Option.toArray
-            this.classMemberSpacing |> Option.bind (constructRuleIfEnabled ClassMemberSpacing.rule) |> Option.toArray
-            this.tupleFormatting |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-            this.patternMatchFormatting |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-        |] |> Array.concat
-
-type RaiseWithTooManyArgsConfig =
-    { failwithBadUsage:EnabledConfig option
-      raiseWithSingleArgument:EnabledConfig option
-      nullArgWithSingleArgument:EnabledConfig option
-      invalidOpWithSingleArgument:EnabledConfig option
-      invalidArgWithTwoArguments:EnabledConfig option
-      failwithfWithArgumentsMatchingFormatString:EnabledConfig option }
-with
-    member this.Flatten() =
-        [|
-            this.failwithBadUsage |> Option.bind (constructRuleIfEnabled FailwithBadUsage.rule) |> Option.toArray
-            this.raiseWithSingleArgument |> Option.bind (constructRuleIfEnabled RaiseWithSingleArgument.rule) |> Option.toArray
-            this.nullArgWithSingleArgument |> Option.bind (constructRuleIfEnabled NullArgWithSingleArgument.rule) |> Option.toArray
-            this.invalidOpWithSingleArgument |> Option.bind (constructRuleIfEnabled InvalidOpWithSingleArgument.rule) |> Option.toArray
-            this.invalidArgWithTwoArguments |> Option.bind (constructRuleIfEnabled InvalidArgWithTwoArguments.rule) |> Option.toArray
-            this.failwithfWithArgumentsMatchingFormatString |> Option.bind (constructRuleIfEnabled FailwithfWithArgumentsMatchingFormatString.rule) |> Option.toArray
-        |] |> Array.concat
-
-type SourceLengthConfig =
-    { maxLinesInLambdaFunction:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInMatchLambdaFunction:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInValue:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInFunction:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInMember:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInConstructor:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInProperty:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInModule:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInRecord:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInEnum:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInUnion:RuleConfig<Helper.SourceLength.Config> option
-      maxLinesInClass:RuleConfig<Helper.SourceLength.Config> option }
-with
-    member this.Flatten() =
-        [|
-            this.maxLinesInLambdaFunction |> Option.bind (constructRuleWithConfig MaxLinesInLambdaFunction.rule) |> Option.toArray
-            this.maxLinesInMatchLambdaFunction |> Option.bind (constructRuleWithConfig MaxLinesInMatchLambdaFunction.rule) |> Option.toArray
-            this.maxLinesInValue |> Option.bind (constructRuleWithConfig MaxLinesInValue.rule) |> Option.toArray
-            this.maxLinesInFunction |> Option.bind (constructRuleWithConfig MaxLinesInFunction.rule) |> Option.toArray
-            this.maxLinesInMember |> Option.bind (constructRuleWithConfig MaxLinesInMember.rule) |> Option.toArray
-            this.maxLinesInConstructor |> Option.bind (constructRuleWithConfig MaxLinesInConstructor.rule) |> Option.toArray
-            this.maxLinesInProperty |> Option.bind (constructRuleWithConfig MaxLinesInProperty.rule) |> Option.toArray
-            this.maxLinesInModule |> Option.bind (constructRuleWithConfig MaxLinesInModule.rule) |> Option.toArray
-            this.maxLinesInRecord |> Option.bind (constructRuleWithConfig MaxLinesInRecord.rule) |> Option.toArray
-            this.maxLinesInEnum |> Option.bind (constructRuleWithConfig MaxLinesInEnum.rule) |> Option.toArray
-            this.maxLinesInUnion |> Option.bind (constructRuleWithConfig MaxLinesInUnion.rule) |> Option.toArray
-            this.maxLinesInClass |> Option.bind (constructRuleWithConfig MaxLinesInClass.rule) |> Option.toArray
-        |] |> Array.concat
-
-type NamesConfig =
-    { interfaceNames:RuleConfig<NamingConfig> option
-      genericTypesNames:RuleConfig<NamingConfig> option
-      exceptionNames:RuleConfig<NamingConfig> option
-      typeNames:RuleConfig<NamingConfig> option
-      recordFieldNames:RuleConfig<NamingConfig> option
-      enumCasesNames:RuleConfig<NamingConfig> option
-      unionCasesNames:RuleConfig<NamingConfig> option
-      moduleNames:RuleConfig<NamingConfig> option
-      literalNames:RuleConfig<NamingConfig> option
-      namespaceNames:RuleConfig<NamingConfig> option
-      memberNames:RuleConfig<NamingConfig> option
-      parameterNames:RuleConfig<NamingConfig> option
-      measureTypeNames:RuleConfig<NamingConfig> option
-      activePatternNames:RuleConfig<NamingConfig> option
-      publicValuesNames:RuleConfig<NamingConfig> option
-      nonPublicValuesNames:RuleConfig<NamingConfig> option
-      privateValuesNames:RuleConfig<NamingConfig> option
-      internalValuesNames:RuleConfig<NamingConfig> option }
-with
-    member this.Flatten() =
-        [|
-            this.interfaceNames |> Option.bind (constructRuleWithConfig InterfaceNames.rule) |> Option.toArray
-            this.genericTypesNames |> Option.bind (constructRuleWithConfig GenericTypesNames.rule) |> Option.toArray
-            this.exceptionNames |> Option.bind (constructRuleWithConfig ExceptionNames.rule) |> Option.toArray
-            this.typeNames |> Option.bind (constructRuleWithConfig TypeNames.rule) |> Option.toArray
-            this.recordFieldNames |> Option.bind (constructRuleWithConfig RecordFieldNames.rule) |> Option.toArray
-            this.enumCasesNames |> Option.bind (constructRuleWithConfig EnumCasesNames.rule) |> Option.toArray
-            this.unionCasesNames |> Option.bind (constructRuleWithConfig UnionCasesNames.rule) |> Option.toArray
-            this.moduleNames |> Option.bind (constructRuleWithConfig ModuleNames.rule) |> Option.toArray
-            this.literalNames |> Option.bind (constructRuleWithConfig LiteralNames.rule) |> Option.toArray
-            this.namespaceNames |> Option.bind (constructRuleWithConfig NamespaceNames.rule) |> Option.toArray
-            this.memberNames |> Option.bind (constructRuleWithConfig MemberNames.rule) |> Option.toArray
-            this.parameterNames |> Option.bind (constructRuleWithConfig ParameterNames.rule) |> Option.toArray
-            this.measureTypeNames |> Option.bind (constructRuleWithConfig MeasureTypeNames.rule) |> Option.toArray
-            this.activePatternNames |> Option.bind (constructRuleWithConfig ActivePatternNames.rule) |> Option.toArray
-            this.publicValuesNames |> Option.bind (constructRuleWithConfig PublicValuesNames.rule) |> Option.toArray
-            this.nonPublicValuesNames |> Option.bind (constructRuleWithConfig PrivateValuesNames.rule) |> Option.toArray
-            this.nonPublicValuesNames |> Option.bind (constructRuleWithConfig InternalValuesNames.rule) |> Option.toArray
-            this.privateValuesNames |> Option.bind (constructRuleWithConfig PrivateValuesNames.rule) |> Option.toArray
-            this.internalValuesNames|> Option.bind (constructRuleWithConfig InternalValuesNames.rule) |> Option.toArray
-        |] |> Array.concat
-
-type NumberOfItemsConfig =
-    { maxNumberOfItemsInTuple:RuleConfig<Helper.NumberOfItems.Config> option
-      maxNumberOfFunctionParameters:RuleConfig<Helper.NumberOfItems.Config> option
-      maxNumberOfMembers:RuleConfig<Helper.NumberOfItems.Config> option
-      maxNumberOfBooleanOperatorsInCondition:RuleConfig<Helper.NumberOfItems.Config> option }
-with
-    member this.Flatten() =
-        [|
-            this.maxNumberOfItemsInTuple |> Option.bind (constructRuleWithConfig MaxNumberOfItemsInTuple.rule) |> Option.toArray
-            this.maxNumberOfFunctionParameters |> Option.bind (constructRuleWithConfig MaxNumberOfFunctionParameters.rule) |> Option.toArray
-            this.maxNumberOfMembers |> Option.bind (constructRuleWithConfig MaxNumberOfMembers.rule) |> Option.toArray
-            this.maxNumberOfBooleanOperatorsInCondition |> Option.bind (constructRuleWithConfig MaxNumberOfBooleanOperatorsInCondition.rule) |> Option.toArray
-        |] |> Array.concat
-
-type BindingConfig =
-    { favourIgnoreOverLetWild:EnabledConfig option
-      wildcardNamedWithAsPattern:EnabledConfig option
-      uselessBinding:EnabledConfig option
-      tupleOfWildcards:EnabledConfig option
-      favourAsKeyword:EnabledConfig option
-      favourTypedIgnore:EnabledConfig option }
-with
-    member this.Flatten() =
-        [|
-            this.favourIgnoreOverLetWild |> Option.bind (constructRuleIfEnabled FavourIgnoreOverLetWild.rule) |> Option.toArray
-            this.favourTypedIgnore |> Option.bind (constructRuleIfEnabled FavourTypedIgnore.rule) |> Option.toArray
-            this.wildcardNamedWithAsPattern |> Option.bind (constructRuleIfEnabled WildcardNamedWithAsPattern.rule) |> Option.toArray
-            this.uselessBinding |> Option.bind (constructRuleIfEnabled UselessBinding.rule) |> Option.toArray
-            this.tupleOfWildcards |> Option.bind (constructRuleIfEnabled TupleOfWildcards.rule) |> Option.toArray
-            this.favourAsKeyword |> Option.bind (constructRuleIfEnabled FavourAsKeyword.rule) |> Option.toArray
-        |] |> Array.concat
-
-type ConventionsConfig =
-    { recursiveAsyncFunction:EnabledConfig option
-      avoidTooShortNames:EnabledConfig option
-      redundantNewKeyword:EnabledConfig option
-      favourStaticEmptyFields:EnabledConfig option
-      asyncExceptionWithoutReturn:EnabledConfig option
-      unneededRecKeyword:EnabledConfig option
-      favourNonMutablePropertyInitialization:EnabledConfig option
-      nestedStatements:RuleConfig<NestedStatements.Config> option
-      cyclomaticComplexity:RuleConfig<CyclomaticComplexity.Config> option
-      reimplementsFunction:EnabledConfig option
-      canBeReplacedWithComposition:EnabledConfig option
-      avoidSinglePipeOperator:EnabledConfig option
-      raiseWithTooManyArgs:RaiseWithTooManyArgsConfig option
-      sourceLength:SourceLengthConfig option
-      naming:NamesConfig option
-      numberOfItems:NumberOfItemsConfig option
-      binding:BindingConfig option
-      favourReRaise:EnabledConfig option
-      favourConsistentThis:RuleConfig<FavourConsistentThis.Config> option
-      suggestUseAutoProperty:EnabledConfig option
-      usedUnderscorePrefixedElements:EnabledConfig option
-      ensureTailCallDiagnosticsInRecursiveFunctions:EnabledConfig option}
-with
-    member this.Flatten() =
-        [|
-            this.recursiveAsyncFunction |> Option.bind (constructRuleIfEnabled RecursiveAsyncFunction.rule) |> Option.toArray
-            this.avoidTooShortNames |> Option.bind (constructRuleIfEnabled AvoidTooShortNames.rule) |> Option.toArray
-            this.redundantNewKeyword |> Option.bind (constructRuleIfEnabled RedundantNewKeyword.rule) |> Option.toArray
-            this.favourNonMutablePropertyInitialization |> Option.bind (constructRuleIfEnabled FavourNonMutablePropertyInitialization.rule) |> Option.toArray
-            this.favourReRaise |> Option.bind (constructRuleIfEnabled FavourReRaise.rule) |> Option.toArray
-            this.favourStaticEmptyFields |> Option.bind (constructRuleIfEnabled FavourStaticEmptyFields.rule) |> Option.toArray
-            this.asyncExceptionWithoutReturn |> Option.bind (constructRuleIfEnabled AsyncExceptionWithoutReturn.rule) |> Option.toArray
-            this.unneededRecKeyword |> Option.bind (constructRuleIfEnabled UnneededRecKeyword.rule) |> Option.toArray
-            this.nestedStatements |> Option.bind (constructRuleWithConfig NestedStatements.rule) |> Option.toArray
-            this.favourConsistentThis |> Option.bind (constructRuleWithConfig FavourConsistentThis.rule) |> Option.toArray
-            this.cyclomaticComplexity |> Option.bind (constructRuleWithConfig CyclomaticComplexity.rule) |> Option.toArray
-            this.reimplementsFunction |> Option.bind (constructRuleIfEnabled ReimplementsFunction.rule) |> Option.toArray
-            this.canBeReplacedWithComposition |> Option.bind (constructRuleIfEnabled CanBeReplacedWithComposition.rule) |> Option.toArray
-            this.avoidSinglePipeOperator|> Option.bind (constructRuleIfEnabled AvoidSinglePipeOperator.rule) |> Option.toArray
-            this.usedUnderscorePrefixedElements |> Option.bind (constructRuleIfEnabled UsedUnderscorePrefixedElements.rule) |> Option.toArray
-            this.raiseWithTooManyArgs |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-            this.sourceLength |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-            this.naming |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-            this.numberOfItems |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-            this.binding |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-            this.suggestUseAutoProperty |> Option.bind (constructRuleIfEnabled SuggestUseAutoProperty.rule) |> Option.toArray
-            this.ensureTailCallDiagnosticsInRecursiveFunctions |> Option.bind (constructRuleIfEnabled EnsureTailCallDiagnosticsInRecursiveFunctions.rule) |> Option.toArray
-        |] |> Array.concat
-
-type TypographyConfig =
-    { indentation:EnabledConfig option
-      maxCharactersOnLine:RuleConfig<MaxCharactersOnLine.Config> option
-      trailingWhitespaceOnLine:RuleConfig<TrailingWhitespaceOnLine.Config> option
-      maxLinesInFile:RuleConfig<MaxLinesInFile.Config> option
-      trailingNewLineInFile:EnabledConfig option
-      noTabCharacters:EnabledConfig option }
-with
-    member this.Flatten() =
-        [|
-            this.indentation |> Option.bind (constructRuleIfEnabled Indentation.rule) |> Option.toArray
-            this.maxCharactersOnLine |> Option.bind (constructRuleWithConfig MaxCharactersOnLine.rule) |> Option.toArray
-            this.trailingWhitespaceOnLine |> Option.bind (constructRuleWithConfig TrailingWhitespaceOnLine.rule) |> Option.toArray
-            this.maxLinesInFile |> Option.bind (constructRuleWithConfig MaxLinesInFile.rule) |> Option.toArray
-            this.trailingNewLineInFile |> Option.bind (constructRuleIfEnabled TrailingNewLineInFile.rule) |> Option.toArray
-            this.noTabCharacters |> Option.bind (constructRuleIfEnabled NoTabCharacters.rule) |> Option.toArray
-        |] |> Array.concat
-
-let private getOrEmptyList hints = hints |> Option.defaultValue [||]
-
+type GlobalConfig = {
+    NumIndentationSpaces:int
+}
 type HintConfig = {
-    add:string [] option
-    ignore:string [] option
+    Add: string list
+    Ignore: string list
 }
 
-type GlobalConfig = {
+type CustomGlobalConfig = {
     numIndentationSpaces:int option
 }
 
-type Configuration =
-    { Global:GlobalConfig option
-      // Deprecated grouped configs. TODO: remove in next major release
-      /// DEPRECATED, provide formatting rules at root level.
-      formatting:FormattingConfig option
-      /// DEPRECATED, provide conventions rules at root level.
-      conventions:ConventionsConfig option
-      /// DEPRECATED, provide typography rules at root level.
-      typography:TypographyConfig option
-      ignoreFiles:string [] option
-      Hints:HintConfig option
-      TypedItemSpacing:RuleConfig<TypedItemSpacing.Config> option
-      TypePrefixing:RuleConfig<TypePrefixing.Config> option
-      UnionDefinitionIndentation:EnabledConfig option
-      ModuleDeclSpacing:EnabledConfig option
-      ClassMemberSpacing:EnabledConfig option
-      TupleCommaSpacing:EnabledConfig option
-      TupleIndentation:EnabledConfig option
-      TupleParentheses:EnabledConfig option
-      PatternMatchClausesOnNewLine:EnabledConfig option
-      PatternMatchOrClausesOnNewLine:EnabledConfig option
-      PatternMatchClauseIndentation:RuleConfig<PatternMatchClauseIndentation.Config> option
-      PatternMatchExpressionIndentation:EnabledConfig option
-      RecursiveAsyncFunction:EnabledConfig option
-      AvoidTooShortNames:EnabledConfig option
-      RedundantNewKeyword:EnabledConfig option
-      FavourNonMutablePropertyInitialization:EnabledConfig option
-      FavourReRaise:EnabledConfig option
-      FavourStaticEmptyFields:EnabledConfig option
-      AsyncExceptionWithoutReturn:EnabledConfig option
-      UnneededRecKeyword:EnabledConfig option
-      NestedStatements:RuleConfig<NestedStatements.Config> option
-      FavourConsistentThis:RuleConfig<FavourConsistentThis.Config> option
-      CyclomaticComplexity:RuleConfig<CyclomaticComplexity.Config> option
-      ReimplementsFunction:EnabledConfig option
-      CanBeReplacedWithComposition:EnabledConfig option
-      AvoidSinglePipeOperator:EnabledConfig option
-      UsedUnderscorePrefixedElements:EnabledConfig option
-      FailwithBadUsage:EnabledConfig option
-      RaiseWithSingleArgument:EnabledConfig option
-      FailwithWithSingleArgument:EnabledConfig option
-      NullArgWithSingleArgument:EnabledConfig option
-      InvalidOpWithSingleArgument:EnabledConfig option
-      InvalidArgWithTwoArguments:EnabledConfig option
-      FailwithfWithArgumentsMatchingFormatString:EnabledConfig option
-      MaxLinesInLambdaFunction:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInMatchLambdaFunction:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInValue:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInFunction:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInMember:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInConstructor:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInProperty:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInModule:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInRecord:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInEnum:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInUnion:RuleConfig<Helper.SourceLength.Config> option
-      MaxLinesInClass:RuleConfig<Helper.SourceLength.Config> option
-      InterfaceNames:RuleConfig<NamingConfig> option
-      GenericTypesNames:RuleConfig<NamingConfig> option
-      ExceptionNames:RuleConfig<NamingConfig> option
-      TypeNames:RuleConfig<NamingConfig> option
-      RecordFieldNames:RuleConfig<NamingConfig> option
-      EnumCasesNames:RuleConfig<NamingConfig> option
-      UnionCasesNames:RuleConfig<NamingConfig> option
-      ModuleNames:RuleConfig<NamingConfig> option
-      LiteralNames:RuleConfig<NamingConfig> option
-      NamespaceNames:RuleConfig<NamingConfig> option
-      MemberNames:RuleConfig<NamingConfig> option
-      ParameterNames:RuleConfig<NamingConfig> option
-      MeasureTypeNames:RuleConfig<NamingConfig> option
-      ActivePatternNames:RuleConfig<NamingConfig> option
-      PublicValuesNames:RuleConfig<NamingConfig> option
-      NonPublicValuesNames:RuleConfig<NamingConfig> option
-      PrivateValuesNames:RuleConfig<NamingConfig> option
-      InternalValuesNames:RuleConfig<NamingConfig> option
-      UnnestedFunctionNames:RuleConfig<NamingConfig> option
-      NestedFunctionNames:RuleConfig<NamingConfig> option
-      MaxNumberOfItemsInTuple:RuleConfig<Helper.NumberOfItems.Config> option
-      MaxNumberOfFunctionParameters:RuleConfig<Helper.NumberOfItems.Config> option
-      MaxNumberOfMembers:RuleConfig<Helper.NumberOfItems.Config> option
-      MaxNumberOfBooleanOperatorsInCondition:RuleConfig<Helper.NumberOfItems.Config> option
-      FavourIgnoreOverLetWild:EnabledConfig option
-      FavourTypedIgnore:EnabledConfig option
-      WildcardNamedWithAsPattern:EnabledConfig option
-      UselessBinding:EnabledConfig option
-      TupleOfWildcards:EnabledConfig option
-      Indentation:EnabledConfig option
-      MaxCharactersOnLine:RuleConfig<MaxCharactersOnLine.Config> option
-      TrailingWhitespaceOnLine:RuleConfig<TrailingWhitespaceOnLine.Config> option
-      MaxLinesInFile:RuleConfig<MaxLinesInFile.Config> option
-      TrailingNewLineInFile:EnabledConfig option
-      NoTabCharacters:EnabledConfig option
-      NoPartialFunctions:RuleConfig<NoPartialFunctions.Config> option
-      SuggestUseAutoProperty:EnabledConfig option
-      EnsureTailCallDiagnosticsInRecursiveFunctions:EnabledConfig option
-      FavourAsKeyword:EnabledConfig option }
-with
-    static member Zero = {
-        Global = None
-        ignoreFiles = None
-        Hints = None
-        formatting = None
-        conventions = None
-        typography = None
-        // Configs for rules.
-        TypedItemSpacing = None
-        TypePrefixing = None
-        UnionDefinitionIndentation = None
-        ModuleDeclSpacing = None
-        ClassMemberSpacing = None
-        TupleCommaSpacing = None
-        TupleIndentation = None
-        TupleParentheses = None
-        PatternMatchClausesOnNewLine = None
-        PatternMatchOrClausesOnNewLine = None
-        PatternMatchClauseIndentation = None
-        PatternMatchExpressionIndentation = None
-        RecursiveAsyncFunction = None
-        AvoidTooShortNames = None
-        RedundantNewKeyword = None
-        FavourNonMutablePropertyInitialization = None
-        FavourReRaise = None
-        FavourStaticEmptyFields = None
-        AsyncExceptionWithoutReturn = None
-        UnneededRecKeyword = None
-        NestedStatements = None
-        FavourConsistentThis = None
-        CyclomaticComplexity = None
-        ReimplementsFunction = None
-        CanBeReplacedWithComposition = None
-        AvoidSinglePipeOperator = None
-        UsedUnderscorePrefixedElements = None
-        FailwithWithSingleArgument = None
-        FailwithBadUsage = None
-        RaiseWithSingleArgument = None
-        NullArgWithSingleArgument = None
-        InvalidOpWithSingleArgument = None
-        InvalidArgWithTwoArguments = None
-        FailwithfWithArgumentsMatchingFormatString = None
-        MaxLinesInLambdaFunction = None
-        MaxLinesInMatchLambdaFunction = None
-        MaxLinesInValue = None
-        MaxLinesInFunction = None
-        MaxLinesInMember = None
-        MaxLinesInConstructor = None
-        MaxLinesInProperty = None
-        MaxLinesInModule = None
-        MaxLinesInRecord = None
-        MaxLinesInEnum = None
-        MaxLinesInUnion = None
-        MaxLinesInClass = None
-        InterfaceNames = None
-        GenericTypesNames = None
-        ExceptionNames = None
-        TypeNames = None
-        RecordFieldNames = None
-        EnumCasesNames = None
-        UnionCasesNames = None
-        ModuleNames = None
-        LiteralNames = None
-        NamespaceNames = None
-        MemberNames = None
-        ParameterNames = None
-        MeasureTypeNames = None
-        ActivePatternNames = None
-        PublicValuesNames = None
-        NonPublicValuesNames = None
-        PrivateValuesNames = None
-        InternalValuesNames = None
-        UnnestedFunctionNames = None
-        NestedFunctionNames = None 
-        MaxNumberOfItemsInTuple = None
-        MaxNumberOfFunctionParameters = None
-        MaxNumberOfMembers = None
-        MaxNumberOfBooleanOperatorsInCondition = None
-        FavourIgnoreOverLetWild = None
-        FavourTypedIgnore = None
-        WildcardNamedWithAsPattern = None
-        UselessBinding = None
-        TupleOfWildcards = None
-        Indentation = None
-        MaxCharactersOnLine = None
-        TrailingWhitespaceOnLine = None
-        MaxLinesInFile = None
-        TrailingNewLineInFile = None
-        NoTabCharacters = None
-        NoPartialFunctions = None
-        SuggestUseAutoProperty = None
-        EnsureTailCallDiagnosticsInRecursiveFunctions = None
-        FavourAsKeyword = None
+type CustomConfiguration =
+    {
+        Global: CustomGlobalConfig option
+        ModuleDeclSpacing: EnabledConfig option
     }
 
-// fsharplint:enable RecordFieldNames
+[<RequireQualifiedAccess>]
+type RuleIdentifier =
+    | TypedItemSpacing
+    | TypePrefixing
+    | UnionDefinitionIndentation
+    | ModuleDeclSpacing
+    | ClassMemberSpacing
+    | TupleCommaSpacing
+    | TupleIndentation
+    | TupleParentheses
+    | PatternMatchClausesOnNewLine
+    | PatternMatchOrClausesOnNewLine
+    | PatternMatchClauseIndentation
+    | PatternMatchExpressionIndentation
+    | RecursiveAsyncFunction
+    | RedundantNewKeyword
+    | NestedStatements
+    | CyclomaticComplexity
+    | ReimplementsFunction
+    | CanBeReplacedWithComposition
+    | AvoidSinglePipeOperator
+    | UsedUnderscorePrefixedElements
+    | FailwithWithSingleArgument
+    | RaiseWithSingleArgument
+    | NullArgWithSingleArgument
+    | InvalidOpWithSingleArgument
+    | InvalidArgWithTwoArguments
+    | FailwithfWithArgumentsMatchingFormatString
+    | FailwithBadUsage
+    | MaxLinesInLambdaFunction
+    | MaxLinesInMatchLambdaFunction
+    | MaxLinesInValue
+    | MaxLinesInFunction
+    | MaxLinesInMember
+    | MaxLinesInConstructor
+    | MaxLinesInProperty
+    | MaxLinesInModule
+    | MaxLinesInRecord
+    | MaxLinesInEnum
+    | MaxLinesInUnion
+    | MaxLinesInClass
+    | InterfaceNames
+    | ExceptionNames
+    | TypeNames
+    | RecordFieldNames
+    | EnumCasesNames
+    | UnionCasesNames
+    | ModuleNames
+    | LiteralNames
+    | NamespaceNames
+    | MemberNames
+    | ParameterNames
+    | MeasureTypeNames
+    | ActivePatternNames
+    | GenericTypesNames
+    | PublicValuesNames
+    | PrivateValuesNames
+    | InternalValuesNames
+    | UnnestedFunctionNames
+    | NestedFunctionNames
+    | MaxNumberOfItemsInTuple
+    | MaxNumberOfFunctionParameters
+    | MaxNumberOfMembers
+    | MaxNumberOfBooleanOperatorsInCondition
+    | FavourIgnoreOverLetWild
+    | WildcardNamedWithAsPattern
+    | UselessBinding
+    | TupleOfWildcards
+    | FavourTypedIgnore
+    | FavourNonMutablePropertyInitialization
+    | FavourReRaise
+    | FavourStaticEmptyFields
+    | FavourConsistentThis
+    | SuggestUseAutoProperty
+    | AvoidTooShortNames
+    | AsyncExceptionWithoutReturn
+    | UnneededRecKeyword
+    | Indentation
+    | MaxCharactersOnLine
+    | TrailingWhitespaceOnLine
+    | MaxLinesInFile
+    | TrailingNewLineInFile
+    | NoTabCharacters
+    | NoPartialFunctions
+    | EnsureTailCallDiagnosticsInRecursiveFunctions
+    | FavourAsKeyword
 
-/// Tries to parse the provided config text.
-let parseConfig (configText:string) =
-    try
-        JsonSerializer.Deserialize<Configuration>(configText, FSharpJsonConverter.jsonOptions)
-    with
-    | ex -> raise <| ConfigurationException $"Couldn't parse config, error=%s{ex.Message}"
+type Rule =
+    | TypedItemSpacing of RuleConfig<TypedItemSpacing.Config>
+    | TypePrefixing of RuleConfig<TypePrefixing.Config>
+    | UnionDefinitionIndentation of EnabledConfig
+    | ModuleDeclSpacing of EnabledConfig
+    | ClassMemberSpacing of EnabledConfig
+    | TupleCommaSpacing of EnabledConfig
+    | TupleIndentation of EnabledConfig
+    | TupleParentheses of EnabledConfig
+    | PatternMatchClausesOnNewLine of EnabledConfig
+    | PatternMatchOrClausesOnNewLine of EnabledConfig
+    | PatternMatchClauseIndentation of RuleConfig<PatternMatchClauseIndentation.Config>
+    | PatternMatchExpressionIndentation of EnabledConfig
+    | RecursiveAsyncFunction of EnabledConfig
+    | RedundantNewKeyword of EnabledConfig
+    | NestedStatements of RuleConfig<NestedStatements.Config>
+    | CyclomaticComplexity of RuleConfig<CyclomaticComplexity.Config>
+    | ReimplementsFunction of EnabledConfig
+    | CanBeReplacedWithComposition of EnabledConfig
+    | AvoidSinglePipeOperator of EnabledConfig
+    | UsedUnderscorePrefixedElements of EnabledConfig
+    | FailwithWithSingleArgument of EnabledConfig
+    | RaiseWithSingleArgument of EnabledConfig
+    | NullArgWithSingleArgument of EnabledConfig
+    | InvalidOpWithSingleArgument of EnabledConfig
+    | InvalidArgWithTwoArguments of EnabledConfig
+    | FailwithfWithArgumentsMatchingFormatString of EnabledConfig
+    | FailwithBadUsage of EnabledConfig
+    | MaxLinesInLambdaFunction of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInMatchLambdaFunction of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInValue of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInFunction of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInMember of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInConstructor of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInProperty of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInModule of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInRecord of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInEnum of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInUnion of RuleConfig<Helper.SourceLength.Config>
+    | MaxLinesInClass of RuleConfig<Helper.SourceLength.Config>
+    | InterfaceNames of RuleConfig<NamingConfig>
+    | ExceptionNames of RuleConfig<NamingConfig>
+    | TypeNames of RuleConfig<NamingConfig>
+    | RecordFieldNames of RuleConfig<NamingConfig>
+    | EnumCasesNames of RuleConfig<NamingConfig>
+    | UnionCasesNames of RuleConfig<NamingConfig>
+    | ModuleNames of RuleConfig<NamingConfig>
+    | LiteralNames of RuleConfig<NamingConfig>
+    | NamespaceNames of RuleConfig<NamingConfig>
+    | MemberNames of RuleConfig<NamingConfig>
+    | ParameterNames of RuleConfig<NamingConfig>
+    | MeasureTypeNames of RuleConfig<NamingConfig>
+    | ActivePatternNames of RuleConfig<NamingConfig>
+    | GenericTypesNames of RuleConfig<NamingConfig>
+    | PublicValuesNames of RuleConfig<NamingConfig>
+    | PrivateValuesNames of RuleConfig<NamingConfig>
+    | InternalValuesNames of RuleConfig<NamingConfig>
+    | UnnestedFunctionNames of RuleConfig<NamingConfig>
+    | NestedFunctionNames of RuleConfig<NamingConfig>
+    | MaxNumberOfItemsInTuple of RuleConfig<Helper.NumberOfItems.Config>
+    | MaxNumberOfFunctionParameters of RuleConfig<Helper.NumberOfItems.Config>
+    | MaxNumberOfMembers of RuleConfig<Helper.NumberOfItems.Config>
+    | MaxNumberOfBooleanOperatorsInCondition of RuleConfig<Helper.NumberOfItems.Config>
+    | FavourIgnoreOverLetWild of EnabledConfig
+    | WildcardNamedWithAsPattern of EnabledConfig
+    | UselessBinding of EnabledConfig
+    | TupleOfWildcards of EnabledConfig
+    | FavourTypedIgnore of EnabledConfig
+    | FavourNonMutablePropertyInitialization of EnabledConfig
+    | FavourReRaise of EnabledConfig
+    | FavourStaticEmptyFields of EnabledConfig
+    | FavourConsistentThis of RuleConfig<FavourConsistentThis.Config>
+    | SuggestUseAutoProperty of EnabledConfig
+    | AvoidTooShortNames of EnabledConfig
+    | AsyncExceptionWithoutReturn of EnabledConfig
+    | UnneededRecKeyword of EnabledConfig
+    | Indentation of EnabledConfig
+    | MaxCharactersOnLine of RuleConfig<MaxCharactersOnLine.Config>
+    | TrailingWhitespaceOnLine of RuleConfig<TrailingWhitespaceOnLine.Config>
+    | MaxLinesInFile of RuleConfig<MaxLinesInFile.Config>
+    | TrailingNewLineInFile of EnabledConfig
+    | NoTabCharacters of EnabledConfig
+    | NoPartialFunctions of RuleConfig<NoPartialFunctions.Config>
+    | EnsureTailCallDiagnosticsInRecursiveFunctions of EnabledConfig
+    | FavourAsKeyword of EnabledConfig    
 
-/// Tries to parse the config file at the provided path.
-let loadConfig (configPath:string) =
-    File.ReadAllText configPath
-    |> parseConfig
+type Configuration =
+    {
+        IgnoreFiles: string list
+        Global: GlobalConfig
+        Hints: HintConfig
+        Rules: Rule list
+    }
+        
+let defaultRules =
+    [
+        TypedItemSpacing Disabled
+        TypePrefixing Disabled
+        UnionDefinitionIndentation Disabled
+        ModuleDeclSpacing Disabled
+        ClassMemberSpacing Disabled
+        TupleCommaSpacing Disabled
+        TupleIndentation Disabled
+        TupleParentheses Disabled
+        PatternMatchClausesOnNewLine Disabled
+        PatternMatchOrClausesOnNewLine Disabled
+        PatternMatchClauseIndentation Disabled
+        PatternMatchExpressionIndentation Disabled
+        RecursiveAsyncFunction Disabled
+        RedundantNewKeyword <| Enabled ()
+        NestedStatements Disabled
+        CyclomaticComplexity Disabled
+        ReimplementsFunction <| Enabled ()
+        CanBeReplacedWithComposition <| Enabled ()
+        AvoidSinglePipeOperator Disabled
+        UsedUnderscorePrefixedElements <| Enabled ()
+        FailwithWithSingleArgument <| Enabled ()
+        RaiseWithSingleArgument <| Enabled ()
+        NullArgWithSingleArgument <| Enabled ()
+        InvalidOpWithSingleArgument <| Enabled ()
+        InvalidArgWithTwoArguments <| Enabled ()
+        FailwithfWithArgumentsMatchingFormatString <| Enabled ()
+        FailwithBadUsage <| Enabled ()
+        MaxLinesInLambdaFunction Disabled
+        MaxLinesInMatchLambdaFunction Disabled
+        MaxLinesInValue Disabled
+        MaxLinesInFunction Disabled
+        MaxLinesInMember Disabled
+        MaxLinesInConstructor Disabled
+        MaxLinesInProperty Disabled
+        MaxLinesInModule Disabled
+        MaxLinesInRecord Disabled
+        MaxLinesInEnum Disabled
+        MaxLinesInUnion Disabled
+        MaxLinesInClass Disabled
+        InterfaceNames (Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = Some "I"
+            Suffix = None 
+        })
+        ExceptionNames (Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = Some "Exception"
+        })
+        TypeNames (Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        })
+        RecordFieldNames <| Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        }
+        EnumCasesNames <| Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        }
+        UnionCasesNames <| Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        }
+        ModuleNames <| Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        }
+        LiteralNames <| Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        }
+        NamespaceNames <| Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        }
+        MemberNames <| Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.AllowPrefix
+            Prefix = None
+            Suffix = None
+        }
+        ParameterNames <| Enabled {
+            Naming = Some NamingCase.CamelCase
+            Underscores = Some NamingUnderscores.AllowPrefix
+            Prefix = None
+            Suffix = None
+        }
+        MeasureTypeNames <| Enabled {
+            Naming = None
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        }
+        ActivePatternNames <| Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        }
+        GenericTypesNames <| Enabled {
+            Naming = Some NamingCase.PascalCase
+            Underscores = Some NamingUnderscores.None
+            Prefix = None
+            Suffix = None
+        }
+        PublicValuesNames <| Enabled {
+            Naming = None
+            Underscores = Some NamingUnderscores.AllowPrefix
+            Prefix = None
+            Suffix = None
+        }
+        PrivateValuesNames <| Enabled {
+            Naming = Some NamingCase.CamelCase
+            Underscores = Some NamingUnderscores.AllowPrefix
+            Prefix = None
+            Suffix = None
+        }
+        InternalValuesNames <| Enabled {
+            Naming = Some NamingCase.CamelCase
+            Underscores = Some NamingUnderscores.AllowPrefix
+            Prefix = None
+            Suffix = None
+        }
+        UnnestedFunctionNames Disabled
+        NestedFunctionNames Disabled
+        MaxNumberOfItemsInTuple Disabled
+        MaxNumberOfFunctionParameters Disabled
+        MaxNumberOfMembers Disabled
+        MaxNumberOfBooleanOperatorsInCondition Disabled
+        FavourIgnoreOverLetWild <| Enabled ()
+        WildcardNamedWithAsPattern <| Enabled ()
+        UselessBinding <| Enabled ()
+        TupleOfWildcards <| Enabled ()
+        FavourTypedIgnore Disabled
+        FavourNonMutablePropertyInitialization Disabled
+        FavourReRaise <| Enabled ()
+        FavourStaticEmptyFields Disabled
+        FavourConsistentThis Disabled
+        SuggestUseAutoProperty Disabled
+        AvoidTooShortNames Disabled
+        AsyncExceptionWithoutReturn Disabled
+        UnneededRecKeyword <| Enabled ()
+        Indentation Disabled
+        MaxCharactersOnLine Disabled
+        TrailingWhitespaceOnLine Disabled
+        MaxLinesInFile Disabled
+        TrailingNewLineInFile Disabled
+        NoTabCharacters <| Enabled ()
+        NoPartialFunctions Disabled
+        EnsureTailCallDiagnosticsInRecursiveFunctions Disabled
+        FavourAsKeyword <| Enabled ()
+    ]
 
-/// A default configuration specifying every analyser and rule is included as a resource file in the framework.
-/// This function loads and returns this default configuration.
 let defaultConfiguration =
-    let assembly = typeof<Rules.Rule>.GetTypeInfo().Assembly
-    let resourceName = Assembly.GetExecutingAssembly().GetManifestResourceNames()
-                       |> Seq.find (fun n -> n.EndsWith(SettingsFileName, System.StringComparison.Ordinal))
-    use stream = assembly.GetManifestResourceStream(resourceName)
-    match stream with
-    | null -> failwithf "Resource '%s' not found in assembly '%s'" resourceName (assembly.FullName)
-    | stream ->
-        use reader = new System.IO.StreamReader(stream)
+    {
+        IgnoreFiles = [
+            "assemblyinfo.*"
+        ]
+        Global = {
+            NumIndentationSpaces = 4 
+        }
+        Hints = {
+            Add = [
+                "not (a =  b) ===> a <> b"
+                "not (a <> b) ===> a =  b"
+                "not (a >  b) ===> a <= b"
+                "not (a >= b) ===> a <  b"
+                "not (a <  b) ===> a >= b"
+                "not (a <= b) ===> a >  b"
+                "compare x y <> 1 ===> x <= y"
+                "compare x y = -1 ===> x < y"
+                "compare x y <> -1 ===> x >= y"
+                "compare x y = 1 ===> x > y"
+                "compare x y <= 0 ===> x <= y"
+                "compare x y <  0 ===> x <  y"
+                "compare x y >= 0 ===> x >= y"
+                "compare x y >  0 ===> x >  y"
+                "compare x y =  0 ===> x =  y"
+                "compare x y <> 0 ===> x <> y"    
+                "List.head (List.sort x) ===> List.min x"
+                "List.head (List.sortBy f x) ===> List.minBy f x"    
+                "List.map f (List.map g x) ===> List.map (g >> f) x"
+                "Array.map f (Array.map g x) ===> Array.map (g >> f) x"
+                "Seq.map f (Seq.map g x) ===> Seq.map (g >> f) x"
+                "List.nth x 0 ===> List.head x"
+                "List.map f (List.replicate n x) ===> List.replicate n (f x)"
+                "List.rev (List.rev x) ===> x"
+                "Array.rev (Array.rev x) ===> x"
+                "List.fold (@) [] x ===> List.concat x"
+                "List.map id x ===> id x"
+                "Array.map id x ===> id x"
+                "Seq.map id x ===> id x"
+                "(List.length x) = 0 ===> List.isEmpty x"
+                "(Array.length x) = 0 ===> Array.isEmpty x"
+                "(Seq.length x) = 0 ===> Seq.isEmpty x"
+                "x = [] ===> List.isEmpty x"
+                "x = [||] ===> Array.isEmpty x"
+                "(List.length x) <> 0 ===> not (List.isEmpty x)"
+                "(Array.length x) <> 0 ===> not (Array.isEmpty x)"
+                "(Seq.length x) <> 0 ===> not (Seq.isEmpty x)"
+                "(List.length x) > 0 ===> not (List.isEmpty x)"
+                "(Array.length x) <> 0 ===> not (Array.isEmpty x)"
+                "(Seq.length x) <> 0 ===> not (Seq.isEmpty x)"    
+                "List.concat (List.map f x) ===> List.collect f x"
+                "Array.concat (Array.map f x) ===> Array.collect f x"
+                "Seq.concat (Seq.map f x) ===> Seq.collect f x"    
+                "List.isEmpty (List.filter f x) ===> not (List.exists f x)"
+                "Array.isEmpty (Array.filter f x) ===> not (Array.exists f x)"
+                "Seq.isEmpty (Seq.filter f x) ===> not (Seq.exists f x)"
+                "not (List.isEmpty (List.filter f x)) ===> List.exists f x"
+                "not (Array.isEmpty (Array.filter f x)) ===> Array.exists f x"
+                "not (Seq.isEmpty (Seq.filter f x)) ===> Seq.exists f x"    
+                "List.length x >= 0 ===> true"
+                "Array.length x >= 0 ===> true"
+                "Seq.length x >= 0 ===> true"    
+                "x = true ===> x"
+                "x = false ===> not x"
+                "true = a ===> a"
+                "false = a ===> not a"
+                "a <> true ===> not a"
+                "a <> false ===> a"
+                "true <> a ===> not a"
+                "false <> a ===> a"
+                "if a then true else false ===> a"
+                "if a then false else true ===> not a"
+                "not (not x) ===> x"    
+                "(fst x, snd x) ===> x"    
+                "true && x ===> x"
+                "false && x ===> false"
+                "true || x ===> true"
+                "false || x ===> x"
+                "not true ===> false"
+                "not false ===> true"
+                "fst (x, y) ===> x"
+                "snd (x, y) ===> y"
+                "List.fold f x [] ===> x"
+                "Array.fold f x [||] ===> x"
+                "List.foldBack f [] x ===> x"
+                "Array.foldBack f [||] x ===> x"
+                "x - 0 ===> x"
+                "x * 1 ===> x"
+                "x / 1 ===> x"    
+                "List.fold (+) 0 x ===> List.sum x"
+                "Array.fold (+) 0 x ===> Array.sum x"
+                "Seq.fold (+) 0 x ===> Seq.sum x"
+                "List.sum (List.map x y) ===> List.sumBy x y"
+                "Array.sum (Array.map x y) ===> Array.sumBy x y"
+                "Seq.sum (Seq.map x y) ===> Seq.sumBy x y"
+                "List.average (List.map x y) ===> List.averageBy x y"
+                "Array.average (Array.map x y) ===> Array.averageBy x y"
+                "Seq.average (Seq.map x y) ===> Seq.averageBy x y"
+                "(List.take x y, List.skip x y) ===> List.splitAt x y"
+                "(Array.take x y, Array.skip x y) ===> Array.splitAt x y"
+                "(Seq.take x y, Seq.skip x y) ===> Seq.splitAt x y"    
+                "List.empty ===> []"
+                "Array.empty ===> [||]"    
+                "x::[] ===> [x]"
+                "pattern: x::[] ===> [x]"    
+                "x @ [] ===> x"    
+                "List.isEmpty [] ===> true"
+                "Array.isEmpty [||] ===> true"    
+                "fun _ -> () ===> ignore"
+                "fun x -> x ===> id"
+                "id x ===> x"
+                "id >> f ===> f"
+                "f >> id ===> f"    
+                "x = null ===> isNull x"
+                "null = x ===> isNull x"
+                "x <> null ===> not (isNull x)"
+                "null <> x ===> not (isNull x)"    
+                "Array.append a (Array.append b c) ===> Array.concat [|a; b; c|]"
+            ]
+            Ignore = [] 
+        }
+        Rules = defaultRules
+    }
 
-        reader.ReadToEnd()
-        |> parseConfig
+let private constructTypePrefixingRuleWithConfig rule (ruleConfig: RuleConfig<TypePrefixing.Config>) =
+    match ruleConfig with
+    | Enabled config ->
+        Some(rule config)
+    | Disabled -> None
+
+let private constructRuleIfEnabled rule = function
+    | Enabled _ -> Some rule
+    | Disabled -> None
+
+let private constructRuleWithConfig rule = function
+    | Enabled config -> Some (rule config)
+    | Disabled -> None
+
+let private flattenRule = function
+    | TypedItemSpacing rule -> rule |> constructRuleWithConfig TypedItemSpacing.rule
+    | TypePrefixing rule -> rule |> constructTypePrefixingRuleWithConfig TypePrefixing.rule
+    | UnionDefinitionIndentation rule -> rule |> constructRuleIfEnabled UnionDefinitionIndentation.rule
+    | ModuleDeclSpacing rule -> rule |> constructRuleIfEnabled ModuleDeclSpacing.rule
+    | ClassMemberSpacing rule -> rule |> constructRuleIfEnabled ClassMemberSpacing.rule
+    | TupleCommaSpacing rule -> rule |> constructRuleIfEnabled TupleCommaSpacing.rule
+    | TupleIndentation rule -> rule |> constructRuleIfEnabled TupleIndentation.rule
+    | TupleParentheses rule -> rule |> constructRuleIfEnabled TupleParentheses.rule
+    | PatternMatchClausesOnNewLine rule -> rule |> constructRuleIfEnabled PatternMatchClausesOnNewLine.rule
+    | PatternMatchOrClausesOnNewLine rule -> rule |> constructRuleIfEnabled PatternMatchOrClausesOnNewLine.rule
+    | PatternMatchClauseIndentation rule -> rule |> constructRuleWithConfig PatternMatchClauseIndentation.rule
+    | PatternMatchExpressionIndentation rule -> rule |> constructRuleIfEnabled PatternMatchExpressionIndentation.rule
+    | RecursiveAsyncFunction rule -> rule |> constructRuleIfEnabled RecursiveAsyncFunction.rule
+    | RedundantNewKeyword rule -> rule |> constructRuleIfEnabled RedundantNewKeyword.rule
+    | NestedStatements rule -> rule |> constructRuleWithConfig NestedStatements.rule
+    | CyclomaticComplexity rule -> rule |> constructRuleWithConfig CyclomaticComplexity.rule
+    | ReimplementsFunction rule -> rule |> constructRuleIfEnabled ReimplementsFunction.rule
+    | CanBeReplacedWithComposition rule -> rule |> constructRuleIfEnabled CanBeReplacedWithComposition.rule
+    | AvoidSinglePipeOperator rule -> rule |> constructRuleIfEnabled AvoidSinglePipeOperator.rule
+    | UsedUnderscorePrefixedElements rule -> rule |> constructRuleIfEnabled UsedUnderscorePrefixedElements.rule
+    | FailwithWithSingleArgument rule -> rule |> constructRuleIfEnabled FailwithWithSingleArgument.rule
+    | RaiseWithSingleArgument rule -> rule |> constructRuleIfEnabled RaiseWithSingleArgument.rule
+    | NullArgWithSingleArgument rule -> rule |> constructRuleIfEnabled NullArgWithSingleArgument.rule
+    | InvalidOpWithSingleArgument rule -> rule |> constructRuleIfEnabled InvalidOpWithSingleArgument.rule
+    | InvalidArgWithTwoArguments rule -> rule |> constructRuleIfEnabled InvalidArgWithTwoArguments.rule
+    | FailwithfWithArgumentsMatchingFormatString rule -> rule |> constructRuleIfEnabled FailwithfWithArgumentsMatchingFormatString.rule
+    | FailwithBadUsage rule -> rule |> constructRuleIfEnabled FailwithBadUsage.rule
+    | MaxLinesInLambdaFunction rule -> rule |> constructRuleWithConfig MaxLinesInLambdaFunction.rule
+    | MaxLinesInMatchLambdaFunction rule -> rule |> constructRuleWithConfig MaxLinesInMatchLambdaFunction.rule
+    | MaxLinesInValue rule -> rule |> constructRuleWithConfig MaxLinesInValue.rule
+    | MaxLinesInFunction rule -> rule |> constructRuleWithConfig MaxLinesInFunction.rule
+    | MaxLinesInMember rule -> rule |> constructRuleWithConfig MaxLinesInMember.rule
+    | MaxLinesInConstructor rule -> rule |> constructRuleWithConfig MaxLinesInConstructor.rule
+    | MaxLinesInProperty rule -> rule |> constructRuleWithConfig MaxLinesInProperty.rule
+    | MaxLinesInModule rule -> rule |> constructRuleWithConfig MaxLinesInModule.rule
+    | MaxLinesInRecord rule -> rule |> constructRuleWithConfig MaxLinesInRecord.rule
+    | MaxLinesInEnum rule -> rule |> constructRuleWithConfig MaxLinesInEnum.rule
+    | MaxLinesInUnion rule -> rule |> constructRuleWithConfig MaxLinesInUnion.rule
+    | MaxLinesInClass rule -> rule |> constructRuleWithConfig MaxLinesInClass.rule
+    | InterfaceNames rule -> rule |> constructRuleWithConfig InterfaceNames.rule
+    | ExceptionNames rule -> rule |> constructRuleWithConfig ExceptionNames.rule
+    | TypeNames rule -> rule |> constructRuleWithConfig TypeNames.rule
+    | RecordFieldNames rule -> rule |> constructRuleWithConfig RecordFieldNames.rule
+    | EnumCasesNames rule -> rule |> constructRuleWithConfig EnumCasesNames.rule
+    | UnionCasesNames rule -> rule |> constructRuleWithConfig UnionCasesNames.rule
+    | ModuleNames rule -> rule |> constructRuleWithConfig ModuleNames.rule
+    | LiteralNames rule -> rule |> constructRuleWithConfig LiteralNames.rule
+    | NamespaceNames rule -> rule |> constructRuleWithConfig NamespaceNames.rule
+    | MemberNames rule -> rule |> constructRuleWithConfig MemberNames.rule
+    | ParameterNames rule -> rule |> constructRuleWithConfig ParameterNames.rule
+    | MeasureTypeNames rule -> rule |> constructRuleWithConfig MeasureTypeNames.rule
+    | ActivePatternNames rule -> rule |> constructRuleWithConfig ActivePatternNames.rule
+    | GenericTypesNames rule -> rule |> constructRuleWithConfig GenericTypesNames.rule
+    | PublicValuesNames rule -> rule |> constructRuleWithConfig PublicValuesNames.rule
+    | PrivateValuesNames rule -> rule |> constructRuleWithConfig PrivateValuesNames.rule
+    | InternalValuesNames rule -> rule |> constructRuleWithConfig InternalValuesNames.rule
+    | UnnestedFunctionNames rule -> rule |> constructRuleWithConfig UnnestedFunctionNames.rule
+    | NestedFunctionNames rule -> rule |> constructRuleWithConfig NestedFunctionNames.rule
+    | MaxNumberOfItemsInTuple rule -> rule |> constructRuleWithConfig MaxNumberOfItemsInTuple.rule
+    | MaxNumberOfFunctionParameters rule -> rule |> constructRuleWithConfig MaxNumberOfFunctionParameters.rule
+    | MaxNumberOfMembers rule -> rule |> constructRuleWithConfig MaxNumberOfMembers.rule
+    | MaxNumberOfBooleanOperatorsInCondition rule -> rule |> constructRuleWithConfig MaxNumberOfBooleanOperatorsInCondition.rule
+    | FavourIgnoreOverLetWild rule -> rule |> constructRuleIfEnabled FavourIgnoreOverLetWild.rule
+    | WildcardNamedWithAsPattern rule -> rule |> constructRuleIfEnabled WildcardNamedWithAsPattern.rule
+    | UselessBinding rule -> rule |> constructRuleIfEnabled UselessBinding.rule
+    | TupleOfWildcards rule -> rule |> constructRuleIfEnabled TupleOfWildcards.rule
+    | FavourTypedIgnore rule -> rule |> constructRuleIfEnabled FavourTypedIgnore.rule
+    | FavourNonMutablePropertyInitialization rule -> rule |> constructRuleIfEnabled FavourNonMutablePropertyInitialization.rule
+    | FavourReRaise rule -> rule |> constructRuleIfEnabled FavourReRaise.rule
+    | FavourStaticEmptyFields rule -> rule |> constructRuleIfEnabled FavourStaticEmptyFields.rule
+    | FavourConsistentThis rule -> rule |> constructRuleWithConfig FavourConsistentThis.rule
+    | SuggestUseAutoProperty rule -> rule |> constructRuleIfEnabled SuggestUseAutoProperty.rule
+    | AvoidTooShortNames rule -> rule |> constructRuleIfEnabled AvoidTooShortNames.rule
+    | AsyncExceptionWithoutReturn rule -> rule |> constructRuleIfEnabled AsyncExceptionWithoutReturn.rule
+    | UnneededRecKeyword rule -> rule |> constructRuleIfEnabled UnneededRecKeyword.rule
+    | Indentation rule -> rule |> constructRuleIfEnabled Indentation.rule
+    | MaxCharactersOnLine rule -> rule |> constructRuleWithConfig MaxCharactersOnLine.rule
+    | TrailingWhitespaceOnLine rule -> rule |> constructRuleWithConfig TrailingWhitespaceOnLine.rule
+    | MaxLinesInFile rule -> rule |> constructRuleWithConfig MaxLinesInFile.rule
+    | TrailingNewLineInFile rule -> rule |> constructRuleIfEnabled TrailingNewLineInFile.rule
+    | NoTabCharacters rule -> rule |> constructRuleIfEnabled NoTabCharacters.rule
+    | NoPartialFunctions rule -> rule |> constructRuleWithConfig NoPartialFunctions.rule
+    | EnsureTailCallDiagnosticsInRecursiveFunctions rule -> rule |> constructRuleIfEnabled EnsureTailCallDiagnosticsInRecursiveFunctions.rule
+    | FavourAsKeyword rule -> rule |> constructRuleIfEnabled FavourAsKeyword.rule
 
 type LineRules =
     { GenericLineRules:RuleMetadata<LineRuleConfig> []
@@ -593,153 +615,224 @@ type LineRules =
       IndentationRule:RuleMetadata<IndentationRuleConfig> option }
 
 type LoadedRules =
-    { GlobalConfig:Rules.GlobalRuleConfig
+    { GlobalConfig: GlobalRuleConfig
       AstNodeRules:RuleMetadata<AstNodeRuleConfig> []
-      LineRules:LineRules
-      DeprecatedRules:Rule [] }
+      LineRules:LineRules }
 
-let getGlobalConfig (globalConfig:GlobalConfig option) =
-    globalConfig
-    |> Option.map (fun globalConfig -> {
-        Rules.GlobalRuleConfig.numIndentationSpaces = globalConfig.numIndentationSpaces |> Option.defaultValue Rules.GlobalRuleConfig.Default.numIndentationSpaces
-    }) |> Option.defaultValue Rules.GlobalRuleConfig.Default
+let private getGlobalConfig (globalConfig: GlobalConfig) =
+    { GlobalRuleConfig.numIndentationSpaces =
+        globalConfig.NumIndentationSpaces }
 
-let private parseHints (hints:string []) =
+let private parseHints (hints:string list) =
     let parseHint hint =
-        match FParsec.CharParsers.run HintParser.phint hint with
+        match FParsec.CharParsers.run phint hint with
         | FParsec.CharParsers.Success(hint, _, _) -> hint
         | FParsec.CharParsers.Failure(error, _, _) ->
             raise <| ConfigurationException $"Failed to parse hint: {hint}{Environment.NewLine}{error}"
 
     hints
-    |> Array.filter (System.String.IsNullOrWhiteSpace >> not)
-    |> Array.map parseHint
-    |> Array.toList
+    |> List.filter (System.String.IsNullOrWhiteSpace >> not)
+    |> List.map parseHint
     |> MergeSyntaxTrees.mergeHints
 
-let flattenConfig (config:Configuration) =
-    let deprecatedAllRules =
-        [|
-            config.formatting |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-            config.conventions |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-            config.typography |> Option.map (fun config -> config.Flatten()) |> Option.toArray |> Array.concat
-            config.Hints |> Option.map (fun config -> HintMatcher.rule { HintMatcher.Config.HintTrie = parseHints (getOrEmptyList config.add) }) |> Option.toArray
-        |] |> Array.concat
-
+let flattenConfig (config: Configuration) =
+    let hints =
+        config.Hints.Add
+        |> parseHints
+        |> fun hints -> HintMatcher.rule { HintTrie = hints }
+            
     let allRules =
-        [|
-            config.TypedItemSpacing |> Option.bind (constructRuleWithConfig TypedItemSpacing.rule)
-            config.TypePrefixing |> Option.bind (constructTypePrefixingRuleWithConfig TypePrefixing.rule)
-            config.UnionDefinitionIndentation |> Option.bind (constructRuleIfEnabled UnionDefinitionIndentation.rule)
-            config.ModuleDeclSpacing |> Option.bind (constructRuleIfEnabled ModuleDeclSpacing.rule)
-            config.ClassMemberSpacing |> Option.bind (constructRuleIfEnabled ClassMemberSpacing.rule)
-            config.TupleCommaSpacing |> Option.bind (constructRuleIfEnabled TupleCommaSpacing.rule)
-            config.TupleIndentation |> Option.bind (constructRuleIfEnabled TupleIndentation.rule)
-            config.TupleParentheses |> Option.bind (constructRuleIfEnabled TupleParentheses.rule)
-            config.PatternMatchClausesOnNewLine |> Option.bind (constructRuleIfEnabled PatternMatchClausesOnNewLine.rule)
-            config.PatternMatchOrClausesOnNewLine |> Option.bind (constructRuleIfEnabled PatternMatchOrClausesOnNewLine.rule)
-            config.PatternMatchClauseIndentation |> Option.bind (constructRuleWithConfig PatternMatchClauseIndentation.rule)
-            config.PatternMatchExpressionIndentation |> Option.bind (constructRuleIfEnabled PatternMatchExpressionIndentation.rule)
-            config.RecursiveAsyncFunction |> Option.bind (constructRuleIfEnabled RecursiveAsyncFunction.rule)
-            config.AvoidTooShortNames |> Option.bind (constructRuleIfEnabled AvoidTooShortNames.rule)
-            config.RedundantNewKeyword |> Option.bind (constructRuleIfEnabled RedundantNewKeyword.rule)
-            config.FavourNonMutablePropertyInitialization |> Option.bind (constructRuleIfEnabled FavourNonMutablePropertyInitialization.rule)
-            config.FavourReRaise |> Option.bind (constructRuleIfEnabled FavourReRaise.rule)
-            config.FavourStaticEmptyFields |> Option.bind (constructRuleIfEnabled FavourStaticEmptyFields.rule)
-            config.AsyncExceptionWithoutReturn |> Option.bind (constructRuleIfEnabled AsyncExceptionWithoutReturn.rule)
-            config.UnneededRecKeyword |> Option.bind (constructRuleIfEnabled UnneededRecKeyword.rule)
-            config.NestedStatements |> Option.bind (constructRuleWithConfig NestedStatements.rule)
-            config.FavourConsistentThis |> Option.bind (constructRuleWithConfig FavourConsistentThis.rule)
-            config.CyclomaticComplexity |> Option.bind (constructRuleWithConfig CyclomaticComplexity.rule)
-            config.ReimplementsFunction |> Option.bind (constructRuleIfEnabled ReimplementsFunction.rule)
-            config.CanBeReplacedWithComposition |> Option.bind (constructRuleIfEnabled CanBeReplacedWithComposition.rule)
-            config.AvoidSinglePipeOperator |> Option.bind (constructRuleIfEnabled AvoidSinglePipeOperator.rule)
-            config.UsedUnderscorePrefixedElements |> Option.bind (constructRuleIfEnabled UsedUnderscorePrefixedElements.rule)
-            config.FailwithBadUsage |> Option.bind (constructRuleIfEnabled FailwithBadUsage.rule)
-            config.RaiseWithSingleArgument |> Option.bind (constructRuleIfEnabled RaiseWithSingleArgument.rule)
-            config.FailwithWithSingleArgument |> Option.bind (constructRuleIfEnabled FailwithWithSingleArgument.rule)
-            config.NullArgWithSingleArgument |> Option.bind (constructRuleIfEnabled NullArgWithSingleArgument.rule)
-            config.InvalidOpWithSingleArgument |> Option.bind (constructRuleIfEnabled InvalidOpWithSingleArgument.rule)
-            config.InvalidArgWithTwoArguments |> Option.bind (constructRuleIfEnabled InvalidArgWithTwoArguments.rule)
-            config.FailwithfWithArgumentsMatchingFormatString |> Option.bind (constructRuleIfEnabled FailwithfWithArgumentsMatchingFormatString.rule)
-            config.MaxLinesInLambdaFunction |> Option.bind (constructRuleWithConfig MaxLinesInLambdaFunction.rule)
-            config.MaxLinesInMatchLambdaFunction |> Option.bind (constructRuleWithConfig MaxLinesInMatchLambdaFunction.rule)
-            config.MaxLinesInValue |> Option.bind (constructRuleWithConfig MaxLinesInValue.rule)
-            config.MaxLinesInFunction |> Option.bind (constructRuleWithConfig MaxLinesInFunction.rule)
-            config.MaxLinesInMember |> Option.bind (constructRuleWithConfig MaxLinesInMember.rule)
-            config.MaxLinesInConstructor |> Option.bind (constructRuleWithConfig MaxLinesInConstructor.rule)
-            config.MaxLinesInProperty |> Option.bind (constructRuleWithConfig MaxLinesInProperty.rule)
-            config.MaxLinesInModule |> Option.bind (constructRuleWithConfig MaxLinesInModule.rule)
-            config.MaxLinesInRecord |> Option.bind (constructRuleWithConfig MaxLinesInRecord.rule)
-            config.MaxLinesInEnum |> Option.bind (constructRuleWithConfig MaxLinesInEnum.rule)
-            config.MaxLinesInUnion |> Option.bind (constructRuleWithConfig MaxLinesInUnion.rule)
-            config.MaxLinesInClass |> Option.bind (constructRuleWithConfig MaxLinesInClass.rule)
-            config.InterfaceNames |> Option.bind (constructRuleWithConfig InterfaceNames.rule)
-            config.GenericTypesNames |> Option.bind (constructRuleWithConfig GenericTypesNames.rule)
-            config.ExceptionNames |> Option.bind (constructRuleWithConfig ExceptionNames.rule)
-            config.TypeNames |> Option.bind (constructRuleWithConfig TypeNames.rule)
-            config.RecordFieldNames |> Option.bind (constructRuleWithConfig RecordFieldNames.rule)
-            config.EnumCasesNames |> Option.bind (constructRuleWithConfig EnumCasesNames.rule)
-            config.UnionCasesNames |> Option.bind (constructRuleWithConfig UnionCasesNames.rule)
-            config.ModuleNames |> Option.bind (constructRuleWithConfig ModuleNames.rule)
-            config.LiteralNames |> Option.bind (constructRuleWithConfig LiteralNames.rule)
-            config.NamespaceNames |> Option.bind (constructRuleWithConfig NamespaceNames.rule)
-            config.MemberNames |> Option.bind (constructRuleWithConfig MemberNames.rule)
-            config.ParameterNames |> Option.bind (constructRuleWithConfig ParameterNames.rule)
-            config.MeasureTypeNames |> Option.bind (constructRuleWithConfig MeasureTypeNames.rule)
-            config.ActivePatternNames |> Option.bind (constructRuleWithConfig ActivePatternNames.rule)
-            config.PublicValuesNames |> Option.bind (constructRuleWithConfig PublicValuesNames.rule)
-            config.NonPublicValuesNames |> Option.bind (constructRuleWithConfig PrivateValuesNames.rule)
-            config.NonPublicValuesNames |> Option.bind (constructRuleWithConfig InternalValuesNames.rule)
-            config.PrivateValuesNames |> Option.bind (constructRuleWithConfig PrivateValuesNames.rule)
-            config.InternalValuesNames |> Option.bind (constructRuleWithConfig InternalValuesNames.rule)
-            config.UnnestedFunctionNames |> Option.bind (constructRuleWithConfig UnnestedFunctionNames.rule)
-            config.NestedFunctionNames |> Option.bind (constructRuleWithConfig NestedFunctionNames.rule)
-            config.MaxNumberOfItemsInTuple |> Option.bind (constructRuleWithConfig MaxNumberOfItemsInTuple.rule)
-            config.MaxNumberOfFunctionParameters |> Option.bind (constructRuleWithConfig MaxNumberOfFunctionParameters.rule)
-            config.MaxNumberOfMembers |> Option.bind (constructRuleWithConfig MaxNumberOfMembers.rule)
-            config.MaxNumberOfBooleanOperatorsInCondition |> Option.bind (constructRuleWithConfig MaxNumberOfBooleanOperatorsInCondition.rule)
-            config.FavourIgnoreOverLetWild |> Option.bind (constructRuleIfEnabled FavourIgnoreOverLetWild.rule)
-            config.FavourTypedIgnore |> Option.bind (constructRuleIfEnabled FavourTypedIgnore.rule)
-            config.WildcardNamedWithAsPattern |> Option.bind (constructRuleIfEnabled WildcardNamedWithAsPattern.rule)
-            config.UselessBinding |> Option.bind (constructRuleIfEnabled UselessBinding.rule)
-            config.TupleOfWildcards |> Option.bind (constructRuleIfEnabled TupleOfWildcards.rule)
-            config.Indentation |> Option.bind (constructRuleIfEnabled Indentation.rule)
-            config.MaxCharactersOnLine |> Option.bind (constructRuleWithConfig MaxCharactersOnLine.rule)
-            config.TrailingWhitespaceOnLine |> Option.bind (constructRuleWithConfig TrailingWhitespaceOnLine.rule)
-            config.MaxLinesInFile |> Option.bind (constructRuleWithConfig MaxLinesInFile.rule)
-            config.TrailingNewLineInFile |> Option.bind (constructRuleIfEnabled TrailingNewLineInFile.rule)
-            config.NoTabCharacters |> Option.bind (constructRuleIfEnabled NoTabCharacters.rule)
-            config.NoPartialFunctions |> Option.bind (constructRuleWithConfig NoPartialFunctions.rule)
-            config.SuggestUseAutoProperty |> Option.bind (constructRuleIfEnabled SuggestUseAutoProperty.rule)
-            config.EnsureTailCallDiagnosticsInRecursiveFunctions |> Option.bind (constructRuleIfEnabled EnsureTailCallDiagnosticsInRecursiveFunctions.rule)
-            config.FavourAsKeyword |> Option.bind (constructRuleIfEnabled FavourAsKeyword.rule)
-        |] |> Array.choose id
-
-    if config.NonPublicValuesNames.IsSome &&
-        (config.PrivateValuesNames.IsSome || config.InternalValuesNames.IsSome) then
-        failwith "nonPublicValuesNames has been deprecated, use privateValuesNames and/or internalValuesNames instead"
-
+        config.Rules
+        |> List.map flattenRule
+        |> List.choose id
+    
     let astNodeRules = ResizeArray()
     let lineRules = ResizeArray()
     let mutable indentationRule = None
     let mutable noTabCharactersRule = None
-    Array.append allRules deprecatedAllRules
-    |> Array.distinctBy (function // Discard any deprecated rules which were define in a non-deprecated form.
-        | Rule.AstNodeRule rule -> rule.Identifier
-        | Rule.LineRule rule -> rule.Identifier
-        | Rule.IndentationRule rule -> rule.Identifier
-        | Rule.NoTabCharactersRule rule -> rule.Identifier)
-    |> Array.iter (function
+    
+    hints :: allRules
+    |> List.iter (function
         | AstNodeRule rule -> astNodeRules.Add rule
         | LineRule rule -> lineRules.Add(rule)
         | IndentationRule rule -> indentationRule <- Some rule
         | NoTabCharactersRule rule -> noTabCharactersRule <- Some rule)
 
     { LoadedRules.GlobalConfig = getGlobalConfig config.Global
-      DeprecatedRules = deprecatedAllRules
       AstNodeRules = astNodeRules.ToArray()
       LineRules =
         { GenericLineRules = lineRules.ToArray()
           IndentationRule = indentationRule
           NoTabCharactersRule = noTabCharactersRule } }
+
+let identifierToString = function
+    | RuleIdentifier.TypedItemSpacing -> Identifiers.TypedItemSpacing
+    | RuleIdentifier.TypePrefixing -> Identifiers.TypePrefixing
+    | RuleIdentifier.UnionDefinitionIndentation -> Identifiers.UnionDefinitionIndentation
+    | RuleIdentifier.ModuleDeclSpacing -> Identifiers.ModuleDeclSpacing
+    | RuleIdentifier.ClassMemberSpacing -> Identifiers.ClassMemberSpacing
+    | RuleIdentifier.TupleCommaSpacing -> Identifiers.TupleCommaSpacing
+    | RuleIdentifier.TupleIndentation -> Identifiers.TupleIndentation
+    | RuleIdentifier.TupleParentheses -> Identifiers.TupleParentheses
+    | RuleIdentifier.PatternMatchClausesOnNewLine -> Identifiers.PatternMatchClausesOnNewLine
+    | RuleIdentifier.PatternMatchOrClausesOnNewLine -> Identifiers.PatternMatchOrClausesOnNewLine
+    | RuleIdentifier.PatternMatchClauseIndentation -> Identifiers.PatternMatchClauseIndentation
+    | RuleIdentifier.PatternMatchExpressionIndentation -> Identifiers.PatternMatchExpressionIndentation
+    | RuleIdentifier.RecursiveAsyncFunction -> Identifiers.RecursiveAsyncFunction
+    | RuleIdentifier.RedundantNewKeyword -> Identifiers.RedundantNewKeyword
+    | RuleIdentifier.NestedStatements -> Identifiers.NestedStatements
+    | RuleIdentifier.CyclomaticComplexity -> Identifiers.CyclomaticComplexity
+    | RuleIdentifier.ReimplementsFunction -> Identifiers.ReimplementsFunction
+    | RuleIdentifier.CanBeReplacedWithComposition -> Identifiers.CanBeReplacedWithComposition
+    | RuleIdentifier.AvoidSinglePipeOperator -> Identifiers.AvoidSinglePipeOperator
+    | RuleIdentifier.UsedUnderscorePrefixedElements -> Identifiers.UsedUnderscorePrefixedElements
+    | RuleIdentifier.FailwithWithSingleArgument -> Identifiers.FailwithWithSingleArgument
+    | RuleIdentifier.RaiseWithSingleArgument -> Identifiers.RaiseWithSingleArgument
+    | RuleIdentifier.NullArgWithSingleArgument -> Identifiers.NullArgWithSingleArgument
+    | RuleIdentifier.InvalidOpWithSingleArgument -> Identifiers.InvalidOpWithSingleArgument
+    | RuleIdentifier.InvalidArgWithTwoArguments -> Identifiers.InvalidArgWithTwoArguments
+    | RuleIdentifier.FailwithfWithArgumentsMatchingFormatString -> Identifiers.FailwithfWithArgumentsMatchingFormattingString
+    | RuleIdentifier.FailwithBadUsage -> Identifiers.FailwithBadUsage
+    | RuleIdentifier.MaxLinesInLambdaFunction -> Identifiers.MaxLinesInLambdaFunction
+    | RuleIdentifier.MaxLinesInMatchLambdaFunction -> Identifiers.MaxLinesInMatchLambdaFunction
+    | RuleIdentifier.MaxLinesInValue -> Identifiers.MaxLinesInValue
+    | RuleIdentifier.MaxLinesInFunction -> Identifiers.MaxLinesInFunction
+    | RuleIdentifier.MaxLinesInMember -> Identifiers.MaxLinesInMember
+    | RuleIdentifier.MaxLinesInConstructor -> Identifiers.MaxLinesInConstructor
+    | RuleIdentifier.MaxLinesInProperty -> Identifiers.MaxLinesInProperty
+    | RuleIdentifier.MaxLinesInModule -> Identifiers.MaxLinesInModule
+    | RuleIdentifier.MaxLinesInRecord -> Identifiers.MaxLinesInRecord
+    | RuleIdentifier.MaxLinesInEnum -> Identifiers.MaxLinesInEnum
+    | RuleIdentifier.MaxLinesInUnion -> Identifiers.MaxLinesInUnion
+    | RuleIdentifier.MaxLinesInClass -> Identifiers.MaxLinesInClass
+    | RuleIdentifier.InterfaceNames -> Identifiers.InterfaceNames
+    | RuleIdentifier.ExceptionNames -> Identifiers.ExceptionNames
+    | RuleIdentifier.TypeNames -> Identifiers.TypeNames
+    | RuleIdentifier.RecordFieldNames -> Identifiers.RecordFieldNames
+    | RuleIdentifier.EnumCasesNames -> Identifiers.EnumCasesNames
+    | RuleIdentifier.UnionCasesNames -> Identifiers.UnionCasesNames
+    | RuleIdentifier.ModuleNames -> Identifiers.ModuleNames
+    | RuleIdentifier.LiteralNames -> Identifiers.LiteralNames
+    | RuleIdentifier.NamespaceNames -> Identifiers.NamespaceNames
+    | RuleIdentifier.MemberNames -> Identifiers.MemberNames
+    | RuleIdentifier.ParameterNames -> Identifiers.ParameterNames
+    | RuleIdentifier.MeasureTypeNames -> Identifiers.MeasureTypeNames
+    | RuleIdentifier.ActivePatternNames -> Identifiers.ActivePatternNames
+    | RuleIdentifier.GenericTypesNames -> Identifiers.GenericTypesNames
+    | RuleIdentifier.PublicValuesNames -> Identifiers.PublicValuesNames
+    | RuleIdentifier.PrivateValuesNames -> Identifiers.PrivateValuesNames
+    | RuleIdentifier.InternalValuesNames -> Identifiers.InternalValuesNames
+    | RuleIdentifier.UnnestedFunctionNames -> Identifiers.UnnestedFunctionNames
+    | RuleIdentifier.NestedFunctionNames -> Identifiers.NestedFunctionNames
+    | RuleIdentifier.MaxNumberOfItemsInTuple -> Identifiers.MaxNumberOfItemsInTuple
+    | RuleIdentifier.MaxNumberOfFunctionParameters -> Identifiers.MaxNumberOfFunctionParameters
+    | RuleIdentifier.MaxNumberOfMembers -> Identifiers.MaxNumberOfMembers
+    | RuleIdentifier.MaxNumberOfBooleanOperatorsInCondition -> Identifiers.MaxNumberOfBooleanOperatorsInCondition
+    | RuleIdentifier.FavourIgnoreOverLetWild -> Identifiers.FavourIgnoreOverLetWild
+    | RuleIdentifier.WildcardNamedWithAsPattern -> Identifiers.WildcardNamedWithAsPattern
+    | RuleIdentifier.UselessBinding -> Identifiers.UselessBinding
+    | RuleIdentifier.TupleOfWildcards -> Identifiers.TupleOfWildcards
+    | RuleIdentifier.FavourTypedIgnore -> Identifiers.FavourTypedIgnore
+    | RuleIdentifier.FavourNonMutablePropertyInitialization -> Identifiers.FavourNonMutablePropertyInitialization
+    | RuleIdentifier.FavourReRaise -> Identifiers.FavourReRaise
+    | RuleIdentifier.FavourStaticEmptyFields -> Identifiers.FavourStaticEmptyFields
+    | RuleIdentifier.FavourConsistentThis -> Identifiers.FavourConsistentThis
+    | RuleIdentifier.SuggestUseAutoProperty -> Identifiers.SuggestUseAutoProperty
+    | RuleIdentifier.AvoidTooShortNames -> Identifiers.AvoidTooShortNames
+    | RuleIdentifier.AsyncExceptionWithoutReturn -> Identifiers.AsyncExceptionWithoutReturn
+    | RuleIdentifier.UnneededRecKeyword -> Identifiers.UnneededRecKeyword
+    | RuleIdentifier.Indentation -> Identifiers.Indentation
+    | RuleIdentifier.MaxCharactersOnLine -> Identifiers.MaxCharactersOnLine
+    | RuleIdentifier.TrailingWhitespaceOnLine -> Identifiers.TrailingWhitespaceOnLine
+    | RuleIdentifier.MaxLinesInFile -> Identifiers.MaxLinesInFile
+    | RuleIdentifier.TrailingNewLineInFile -> Identifiers.TrailingNewLineInFile
+    | RuleIdentifier.NoTabCharacters -> Identifiers.NoTabCharacters
+    | RuleIdentifier.NoPartialFunctions -> Identifiers.NoPartialFunctions
+    | RuleIdentifier.EnsureTailCallDiagnosticsInRecursiveFunctions -> Identifiers.EnsureTailCallDiagnosticsInRecursiveFunctions
+    | RuleIdentifier.FavourAsKeyword -> Identifiers.FavourAsKeyword
+
+let ruleToIdentifier = function
+    | TypedItemSpacing _ -> RuleIdentifier.TypedItemSpacing
+    | TypePrefixing _ -> RuleIdentifier.TypePrefixing
+    | UnionDefinitionIndentation _ -> RuleIdentifier.UnionDefinitionIndentation
+    | ModuleDeclSpacing _ -> RuleIdentifier.ModuleDeclSpacing
+    | ClassMemberSpacing _ -> RuleIdentifier.ClassMemberSpacing
+    | TupleCommaSpacing _ -> RuleIdentifier.TupleCommaSpacing
+    | TupleIndentation _ -> RuleIdentifier.TupleIndentation
+    | TupleParentheses _ -> RuleIdentifier.TupleParentheses
+    | PatternMatchClausesOnNewLine _ -> RuleIdentifier.PatternMatchClausesOnNewLine
+    | PatternMatchOrClausesOnNewLine _ -> RuleIdentifier.PatternMatchOrClausesOnNewLine
+    | PatternMatchClauseIndentation _ -> RuleIdentifier.PatternMatchClauseIndentation
+    | PatternMatchExpressionIndentation _ -> RuleIdentifier.PatternMatchExpressionIndentation
+    | RecursiveAsyncFunction _ -> RuleIdentifier.RecursiveAsyncFunction
+    | RedundantNewKeyword _ -> RuleIdentifier.RedundantNewKeyword
+    | NestedStatements _ -> RuleIdentifier.NestedStatements
+    | CyclomaticComplexity _ -> RuleIdentifier.CyclomaticComplexity
+    | ReimplementsFunction _ -> RuleIdentifier.ReimplementsFunction
+    | CanBeReplacedWithComposition _ -> RuleIdentifier.CanBeReplacedWithComposition
+    | AvoidSinglePipeOperator _ -> RuleIdentifier.AvoidSinglePipeOperator
+    | UsedUnderscorePrefixedElements _ -> RuleIdentifier.UsedUnderscorePrefixedElements
+    | FailwithWithSingleArgument _ -> RuleIdentifier.FailwithWithSingleArgument
+    | RaiseWithSingleArgument _ -> RuleIdentifier.RaiseWithSingleArgument
+    | NullArgWithSingleArgument _ -> RuleIdentifier.NullArgWithSingleArgument
+    | InvalidOpWithSingleArgument _ -> RuleIdentifier.InvalidOpWithSingleArgument
+    | InvalidArgWithTwoArguments _ -> RuleIdentifier.InvalidArgWithTwoArguments
+    | FailwithfWithArgumentsMatchingFormatString _ -> RuleIdentifier.FailwithfWithArgumentsMatchingFormatString
+    | FailwithBadUsage _ -> RuleIdentifier.FailwithBadUsage
+    | MaxLinesInLambdaFunction _ -> RuleIdentifier.MaxLinesInLambdaFunction
+    | MaxLinesInMatchLambdaFunction _ -> RuleIdentifier.MaxLinesInMatchLambdaFunction
+    | MaxLinesInValue _ -> RuleIdentifier.MaxLinesInValue
+    | MaxLinesInFunction _ -> RuleIdentifier.MaxLinesInFunction
+    | MaxLinesInMember _ -> RuleIdentifier.MaxLinesInMember
+    | MaxLinesInConstructor _ -> RuleIdentifier.MaxLinesInConstructor
+    | MaxLinesInProperty _ -> RuleIdentifier.MaxLinesInProperty
+    | MaxLinesInModule _ -> RuleIdentifier.MaxLinesInModule
+    | MaxLinesInRecord _ -> RuleIdentifier.MaxLinesInRecord
+    | MaxLinesInEnum _ -> RuleIdentifier.MaxLinesInEnum
+    | MaxLinesInUnion _ -> RuleIdentifier.MaxLinesInUnion
+    | MaxLinesInClass _ -> RuleIdentifier.MaxLinesInClass
+    | InterfaceNames _ -> RuleIdentifier.InterfaceNames
+    | ExceptionNames _ -> RuleIdentifier.ExceptionNames
+    | TypeNames _ -> RuleIdentifier.TypeNames
+    | RecordFieldNames _ -> RuleIdentifier.RecordFieldNames
+    | EnumCasesNames _ -> RuleIdentifier.EnumCasesNames
+    | UnionCasesNames _ -> RuleIdentifier.UnionCasesNames
+    | ModuleNames _ -> RuleIdentifier.ModuleNames
+    | LiteralNames _ -> RuleIdentifier.LiteralNames
+    | NamespaceNames _ -> RuleIdentifier.NamespaceNames
+    | MemberNames _ -> RuleIdentifier.MemberNames
+    | ParameterNames _ -> RuleIdentifier.ParameterNames
+    | MeasureTypeNames _ -> RuleIdentifier.MeasureTypeNames
+    | ActivePatternNames _ -> RuleIdentifier.ActivePatternNames
+    | GenericTypesNames _ -> RuleIdentifier.GenericTypesNames
+    | PublicValuesNames _ -> RuleIdentifier.PublicValuesNames
+    | PrivateValuesNames _ -> RuleIdentifier.PrivateValuesNames
+    | InternalValuesNames _ -> RuleIdentifier.InternalValuesNames
+    | UnnestedFunctionNames _ -> RuleIdentifier.UnnestedFunctionNames
+    | NestedFunctionNames _ -> RuleIdentifier.NestedFunctionNames
+    | MaxNumberOfItemsInTuple _ -> RuleIdentifier.MaxNumberOfItemsInTuple
+    | MaxNumberOfFunctionParameters _ -> RuleIdentifier.MaxNumberOfFunctionParameters
+    | MaxNumberOfMembers _ -> RuleIdentifier.MaxNumberOfMembers
+    | MaxNumberOfBooleanOperatorsInCondition _ -> RuleIdentifier.MaxNumberOfBooleanOperatorsInCondition
+    | FavourIgnoreOverLetWild _ -> RuleIdentifier.FavourIgnoreOverLetWild
+    | WildcardNamedWithAsPattern _ -> RuleIdentifier.WildcardNamedWithAsPattern
+    | UselessBinding _ -> RuleIdentifier.UselessBinding
+    | TupleOfWildcards _ -> RuleIdentifier.TupleOfWildcards
+    | FavourTypedIgnore _ -> RuleIdentifier.FavourTypedIgnore
+    | FavourNonMutablePropertyInitialization _ -> RuleIdentifier.FavourNonMutablePropertyInitialization
+    | FavourReRaise _ -> RuleIdentifier.FavourReRaise
+    | FavourStaticEmptyFields _ -> RuleIdentifier.FavourStaticEmptyFields
+    | FavourConsistentThis _ -> RuleIdentifier.FavourConsistentThis
+    | SuggestUseAutoProperty _ -> RuleIdentifier.SuggestUseAutoProperty
+    | AvoidTooShortNames _ -> RuleIdentifier.AvoidTooShortNames
+    | AsyncExceptionWithoutReturn _ -> RuleIdentifier.AsyncExceptionWithoutReturn
+    | UnneededRecKeyword _ -> RuleIdentifier.UnneededRecKeyword
+    | Indentation _ -> RuleIdentifier.Indentation
+    | MaxCharactersOnLine _ -> RuleIdentifier.MaxCharactersOnLine
+    | TrailingWhitespaceOnLine _ -> RuleIdentifier.TrailingWhitespaceOnLine
+    | MaxLinesInFile _ -> RuleIdentifier.MaxLinesInFile
+    | TrailingNewLineInFile _ -> RuleIdentifier.TrailingNewLineInFile
+    | NoTabCharacters _ -> RuleIdentifier.NoTabCharacters
+    | NoPartialFunctions _ -> RuleIdentifier.NoPartialFunctions
+    | EnsureTailCallDiagnosticsInRecursiveFunctions _ -> RuleIdentifier.EnsureTailCallDiagnosticsInRecursiveFunctions
+    | FavourAsKeyword _ -> RuleIdentifier.FavourAsKeyword

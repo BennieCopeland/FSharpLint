@@ -1,7 +1,7 @@
-﻿module FSharpLint.Core.Tests.TestConfiguration
+﻿module FSharpLint.Core.Tests.TestJsonConfiguration
 
 open NUnit.Framework
-open FSharpLint.Framework.Configuration
+open FSharpLint.Framework.JsonConfiguration
 
 type System.String with
     member path.ToPlatformIndependentPath() =
@@ -12,7 +12,7 @@ let configWithHints hints =
 
 
 [<TestFixture>]
-type TestConfiguration() =
+type TestJsonConfiguration() =
     [<Test>]
     member _.``Ignore all files ignores any given file.``() =
         let ignorePaths = [ IgnoreFiles.parseIgnorePath "*" ]

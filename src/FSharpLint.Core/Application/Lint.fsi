@@ -8,7 +8,7 @@ module ConfigurationManagement =
     open FSharpLint.Framework.Configuration
 
     /// Load a FSharpLint configuration file from the contents (string) of the file.
-    val loadConfigurationFile : configurationFileText:string -> Configuration
+    val loadConfigurationFile : configurationFileText:string -> CustomConfiguration
 
 /// Provides an API for running FSharpLint from within another application.
 [<AutoOpen>]
@@ -37,7 +37,7 @@ module Lint =
         member FilePath : unit -> string
 
     type ConfigurationParam =
-        | Configuration of Configuration
+        | Configuration of CustomConfiguration
         | FromFile of configPath:string
         /// Tries to load the config from file `fsharplint.json`.
         /// If this file doesn't exist or is invalid, falls back to the default configuration.
